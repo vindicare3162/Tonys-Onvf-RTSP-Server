@@ -164,7 +164,18 @@ ssh root@192.168.1.51 'cd /mnt/user/appdata/onvif-rtsp && docker tag 23dc2441ce3
 
 ## Open questions / follow-ups
 
-- **Push** the five commits to the vindicare3162 fork so Tower could `git pull` instead of scp.
+- **CPU cost of the snapshot cache** (measured 10:31 AEST, 3 min after deploy): container
+  87-136% of one core on the 56-core host; `python` ~90% in bursts (31% averaged since
+  start), `ffmpeg` itself negligible (it mostly waits for a keyframe). Cadence is one
+  capture every ~2.2 s across the three cameras (~6.7 s per camera). The cost is PIL:
+  decoding a 4K/8K JPEG for the grey check, and for the Reolink re-encoding a 7 MB 8K JPEG
+  up to four times to get under 3.5 MB. Cheap remedies for the next deploy, in order:
+  (1) `img.draft('L', (400, 400))` before `convert` in `grey_blob_signature` (decodes at
+  1/8 scale, ~50x cheaper); (2) in `_shrink_jpeg_if_needed` try a 50% downscale at
+  quality 70 first instead of walking the quality ladder at full size; (3) raise the
+  loop sleep from 3 s to 5 s; (4) capture with `-q:v 4` so the Reolink lands nearer the
+  cap without recompression. None of these change correctness.
+- **Push** the six commits to the vindicare3162 fork so Tower could `git pull` instead of scp.
 - Watch Protect for a day: do motion-event thumbnails now appear for all three cameras?
 - Reolink 8K snapshots land at JPEG quality 35 after recompression. If thumbnails look too
   soft, prefer a 50% downscale at quality 70 over quality 35 at full size (edit the ladder
