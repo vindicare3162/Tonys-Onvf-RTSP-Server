@@ -22,6 +22,100 @@ Canonical copy lives here in the repo; a synced copy goes to the Obsidian vault 
 - **Committed locally** as four commits by concern (f7a9af7 snapshots, 6d1255c ONVIF events,
   96c6f58 watchdog, 65f77cc vNICs) plus this file. **Not pushed** to the fork yet.
 - **Next:** watch Protect thumbnails over a day; see "Open questions" for follow-ups.
+## ACTIVE WORKSTREAM: full Protect control (PTZ, lights, siren, IR) — started 2026-10-04
+
+Ben's brief (via /loop, full autonomy): build out PTZ-style controls for both camera brands so
+they can be controlled as fully as possible from inside UniFi Protect: movement, lights,
+sirens, IR. Use subagents for research, design validation and QA. Loop ends only when fully
+implemented or an insurmountable blocker is hit.
+
+Progress (update every iteration):
+- [x] Research (4 agents): prior-art PTZ proxy, Protect third-party capabilities, Tapo C575D,
+      Reolink API. Key facts in the 2026-10-04 discovery log entry below.
+- [x] Design written + independently reviewed (Plan agent); reviewer's corrections adopted.
+      Design doc: scratchpad `design/DESIGN.md` (session-local), summary below.
+- [x] Implemented (uncommitted, not deployed yet):
+      - `app/device_control/`: `soap.py` (raw SOAP + WS-Security digest w/ clock offset),
+        `ptz.py` (probe once in background; ONE worker per physical camera with latest-wins
+        move/stop mailbox; dead-man refresh: upstream ContinuousMove Timeout <=2 s re-sent each
+        second while held, capped `maxMoveSeconds`=30; bounded waits + 10 s breaker; Home
+        emulated via a preset named "Home"), `reolink.py` (HTTPS first, token reuse, relogin
+        once on -6, persisted credential-failure flag, siren in self-terminating "times" mode
+        capped 60 s), `tapo.py` (pytapo, retryStok=False, one login attempt per credential set,
+        persisted failure; inert without cloud password), `controller.py` (Relay model,
+        Reolink/ONVIF imaging adapters, registry: one controller per physical host),
+        `state.py` (data/device_control_state.json).
+      - `app/onvif_control.py`: PTZ ver20, Imaging ver20, DeviceIO ver10 handlers, relay
+        events tns1:Device/Trigger/Relay, exact-op parser, nested ONVIF faults, action log
+        lines `[ONVIF Control (<cam>)] <Service>.<Op> from <ip>`.
+      - `app/onvif_service.py`: device service now dispatches on exact op (unknown op ->
+        ActionNotSupported fault + log line); new routes /onvif/ptz_service,
+        /onvif/imaging_service, /onvif/deviceio_service (+ /onvif/PTZ etc aliases);
+        GetCapabilities/GetServices/GetProfiles/GetScopes/GetEventProperties reflect real
+        capabilities (Imaging/DeviceIO no longer falsely advertised when off).
+      - `app/camera.py`: `deviceControl` config persisted; UI view hides cloud password.
+      - `app/control_api.py`: Protect webhook API `/api/control/<id>/<action>?token=` and
+        settings API `/api/cameras/<id>/device-control` (GET/PUT).
+      - Dockerfile: `pip install pytapo` in its own layer.
+- [x] Live test of the PTZ controller against the real Tapo (staged copy in container):
+      probe ok (profile_1, pan/tilt only, 8 presets), status/presets <0.1 s, timed move stops
+      at ~1.1 s, held move + explicit stop, 20-thread burst + stop all end stopped, camera
+      returned to its start position. **Tapo quirk found: fractional xs:duration ("PT1.0S")
+      makes its SOAP server return a corrupted HTTP response; whole seconds only.**
+- [x] QA agent: 96-test suite in `tests/` (fake ONVIF camera + fake Reolink API, no real
+      cameras). First run 86/96: 10 real defects (PTZ worker death on refresh error, registry
+      rebuilding the shared Tapo controller on every access, relay events lost on rebuild,
+      non-idempotent PTZ retried after send, Stop starved behind queued jobs, DeviceIO answering
+      in tds namespace, siren timer races, double-escaped preset names, 500s on bad input,
+      permanent HTTP fallback). All fixed; suite 96/96.
+      Run: `<venv>/python.exe -m pytest tests -q -p no:cacheprovider` (venv needs flask,
+      flask-cors, requests, pytest, cryptography).
+      Deliberate deviation from the reviewer: unknown device-service ops keep the legacy
+      GetDeviceInformation reply (adoption-regression risk) but are logged as
+      "Unhandled device operation '<op>'".
+- [x] Deployed 2026-10-04 01:53 AEST (image 8bfb2da41b9c; previous 78ac74c07e64 = rollback).
+      Server repo had CRLF noise from the Windows tarball; EOL-only diffs reverted.
+- [x] Cameras configured via the settings API (see config below).
+- [x] End-to-end ONVIF test against the VIRTUAL cameras (Basic auth, as Protect does):
+      discovery correct per camera; Tapo Zoom ContinuousMove/Stop/AbsoluteMove-back via
+      /onvif/ptz_service moved the real head and returned it; bad profile -> NoProfile;
+      Reolink SetRelayOutputState Floodlight active/inactive switched the real light;
+      relay events arrived via PullMessages; imaging options/settings served for Reolink
+      (IR ON/OFF/AUTO + sliders 0-255) and Tapo Wide (sliders 0-100).
+- [ ] QA re-review of the fixes (running)
+- [ ] Commit
+- [ ] **Ben: re-adopt Tapo Zoom and Reolink (and Wide) in Protect** - Protect caches
+      capabilities at adoption; until then it hasn't called any new service. After that, grep
+      the container log for `ONVIF Control` / `Unhandled device operation` to see exactly
+      what Protect uses, and adjust.
+
+How to drive things manually / from Protect Alarm Manager webhooks:
+- Token per camera: `curl -s http://192.168.1.51:5552/api/cameras/<id>/device-control`
+  (`config.webhookToken`).
+- `http://192.168.1.51:5552/api/control/<id>/<action>?token=<token>` with action one of
+  light_on, light_off, siren_on[?seconds=N], siren_off, ir_on, ir_off, privacy_on,
+  privacy_off, daynight_auto, daynight_day, daynight_night, ptz_preset/<token-or-name>,
+  ptz_home, ptz_stop, ptz_move?x=&y=&seconds=, state, help.
+  Camera ids: 2 = Tapo Zoom, 3 = Reolink, 4 = Tapo Wide.
+- Change settings: `curl -X PUT -H 'Content-Type: application/json' -d '{...}'
+  http://192.168.1.51:5552/api/cameras/<id>/device-control` (keys: backend, host, ptz
+  {enabled,inProfile,profileToken,maxMoveSeconds}, relays [..], imaging, sirenSeconds,
+  tapoCloudPassword, regenerateWebhookToken).
+
+Per-camera config (`deviceControl`, applied 2026-10-04):
+- Tapo C575D Zoom: backend tapo, ptz.enabled true, imaging false (ONVIF imaging only covers
+  the wide lens source raw_vs1).
+- Tapo C575D Wide: backend tapo, ptz.enabled false, imaging true (sliders; day/night needs
+  cloud password).
+- Reolink: backend reolink, relays Floodlight/Siren/IR_Illuminator, imaging true
+  (sliders + IrCutFilter <-> day/night), sirenSeconds 10.
+
+Blocked on Ben (cannot be done autonomously):
+- Tapo siren / spotlight / privacy / day-night need the TP-Link cloud password + "Third-Party
+  Compatibility" ON in the Tapo app. Set via PUT /api/cameras/<id>/device-control
+  {"tapoCloudPassword": "..."}. ~5 failed logins left before a temporary lockout: do not guess.
+- Re-adoption in Protect (and confirming the Protect version, >= 7.2 for relay actions).
+
 ## Deployment facts (so nobody has to rediscover them)
 
 | Item | Value |
@@ -49,6 +143,28 @@ Files: `app/camera.py`, `app/ffmpeg_manager.py`, `app/linux_network.py`, `app/ma
 5. `linux_network.py`: escape dots in VLAN parent names for sysctl keys; don't `dhclient -r` before requesting (prevents IP swaps between vNICs on restart).
 
 ## Session log
+
+### 2026-10-04 — PTZ / lights / siren pass-through: discovery (no code changes)
+- Virtual cameras implement only device, media, snapshot and events. **No PTZ service.**
+  Imaging and DeviceIO XAddrs are advertised in GetCapabilities but have no handlers (404).
+  Relay outputs reported as 0. Protect has only ever called device/events/subscription.
+- Physical capabilities (queried over ONVIF and the Reolink HTTP API, read-only):
+  - **Tapo C575D** (192.168.5.70:2020, PTZ XAddr `/onvif/service`): pan/tilt continuous,
+    absolute, relative; 8 presets; no ONVIF zoom space; no aux commands; no DeviceIO.
+  - **Reolink Elite Pro Floodlight**: no ONVIF PTZ, no DeviceIO, no relays. Its HTTP API
+    (`/cgi-bin/api.cgi?cmd=...`, token login, needs `cmd` in the query string) exposes
+    `ledControl` (floodlight: GetWhiteLed shows mode 0 / state 0 / bright 100, AI trigger
+    people=1, schedule 18:00-06:00), `supportAudioAlarm` (siren, currently enable 0) and
+    IR lights (Auto). `floodLight` / `ptzCtrl` abilities are 0.
+- **UniFi Protect** supports ONVIF PTZ on third-party cameras from Protect **5.1.78**;
+  existing third-party cameras must be **re-adopted** to pick it up. Per Ubiquiti, only
+  motion, PTZ and audio are supported for third-party cameras: no lights, sirens or relays.
+  UNVR version unknown (no key-based SSH from this machine).
+- Prior art: github.com/connorgallopo/rtsp-to-onvif proxies PTZ and imaging into Protect
+  (forwards Protect's WS-Security signature untouched, so it needs identical creds; ours
+  differ, so we must re-sign with the physical camera's creds).
+- Proposed plan (awaiting Ben's go-ahead): see the PTZ / lights plan in the chat of
+  2026-10-04; summary in "Open questions / follow-ups".
 
 ### 2026-10-03 (session 2, part 2) — deploy after shfs recovery
 - Ben rebooted Tower (shfs recovered; parity check running afterwards, normal after a hard
@@ -164,6 +280,16 @@ ssh root@192.168.1.51 'cd /mnt/user/appdata/onvif-rtsp && docker tag 23dc2441ce3
 
 ## Open questions / follow-ups
 
+- **PTZ pass-through (proposed):** add `/onvif/ptz_service` to the virtual camera, advertise
+  it in GetCapabilities/GetServices and add a PTZConfiguration to GetProfiles, gated by a new
+  per-camera `enablePtz` flag (Tapo Zoom only - one physical head). Translate each call with
+  onvif-zeep to the physical camera, swapping profile tokens and re-signing with physical
+  creds. Then re-adopt the Tapo Zoom in Protect (needs Protect >= 5.1.78).
+- **Floodlight / siren (proposed):** Protect cannot drive these. Options: Reolink native
+  automation (floodlight mode 1 "night smart" with the existing people trigger - zero code);
+  a small Reolink HTTP client in the proxy with endpoints/web-UI buttons; Protect Alarm
+  Manager webhook -> proxy endpoint (verify webhook action exists on Ben's Protect version).
+- **Fix the false Imaging/DeviceIO advertisement** (or implement Imaging for IR mode).
 - **CPU cost of the snapshot cache** (measured 10:31 AEST, 3 min after deploy): container
   87-136% of one core on the 56-core host; `python` ~90% in bursts (31% averaged since
   start), `ffmpeg` itself negligible (it mostly waits for a keyframe). Cadence is one
