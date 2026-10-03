@@ -57,6 +57,10 @@ RUN pip install --no-cache-dir \
 # Pre-download the default YOLO model so it's available immediately at runtime
 RUN python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
 
+# Tapo local control API (siren, spotlight, night vision, privacy). Separate
+# layer so adding it doesn't invalidate the large PyTorch layers above.
+RUN pip install --no-cache-dir pytapo==3.4.26
+
 # Copy the rest of the application
 COPY . .
 

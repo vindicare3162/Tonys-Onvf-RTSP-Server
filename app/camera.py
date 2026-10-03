@@ -212,6 +212,10 @@ class VirtualONVIFCamera:
         self._event_forwarding_running = False
         self.event_logs = []
 
+        # Physical-device control (PTZ, floodlight, siren, IR) exposed to the NVR
+        # over ONVIF. Absent/empty = feature off. See app/device_control/.
+        self.device_control = dict(config.get('deviceControl') or {})
+
         # Background snapshot cache - see start_snapshot_cache() for why this
         # exists instead of capturing on-demand per request.
         self._snapshot_cache_thread = None
@@ -410,6 +414,11 @@ class VirtualONVIFCamera:
         """Mark camera as stopped, shutdown ONVIF service, and cleanup networking"""
         self.status = "stopped"
         self.stop_snapshot_cache()
+        if self.onvif_service:
+            try:
+                self.onvif_service.controls.detach()
+            except Exception:
+                pass
         if self.enable_event_forwarding:
             self.stop_event_forwarding()
             self.stop_ai_detection()
@@ -449,6 +458,12 @@ class VirtualONVIFCamera:
         self.onvif_service = ONVIFService(self)
         app = self.onvif_service.create_app()
         self.flask_app = app
+        try:
+            # Builds (or reuses) the physical-device controller, which starts its
+            # background probes, and subscribes to relay changes for ONVIF events.
+            self.onvif_service.controls.attach()
+        except Exception as e:
+            print(f"  [Camera ({self.name})] Device control unavailable: {e}")
         
         # Use assigned IP if available, otherwise 0.0.0.0
         bind_ip = self.assigned_ip if self.assigned_ip else '0.0.0.0'
@@ -529,6 +544,28 @@ class VirtualONVIFCamera:
     def sub_framerate(self, value):
         self._sub_framerate = value
 
+    def _device_control_public(self):
+        """deviceControl for the UI: never includes the encrypted cloud password."""
+        dc = {k: v for k, v in (self.device_control or {}).items() if k != 'tapoCloudPasswordEnc'}
+        dc['tapoCloudConfigured'] = bool((self.device_control or {}).get('tapoCloudPasswordEnc'))
+        return dc
+
+    def _device_control_status(self):
+        try:
+            from .device_control import CameraControl
+            # Peek only: UI polling must not build controllers (threads, logins)
+            # for stopped cameras.
+            c = CameraControl(self, build=False)
+            if not c.enabled:
+                return None
+            st = c.ctl.status()
+            st['ptzEnabled'] = bool(c.ptz)
+            st['relays'] = {r.token: r.active for r in c.relays}
+            st['imaging'] = c.imaging is not None
+            return st
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}"}
+
     def to_dict(self):
         """Convert to dictionary for API"""
         return {
@@ -581,6 +618,8 @@ class VirtualONVIFCamera:
             'physicalOnvifPort': self.physical_onvif_port,
             'onvifForwardingUsername': self.onvif_forwarding_username,
             'onvifForwardingPassword': self.onvif_forwarding_password,
+            'deviceControl': self._device_control_public(),
+            'deviceControlStatus': self._device_control_status(),
             'eventSource': self.event_source,
             'aiTargets': self.ai_targets,
             'aiModel': self.ai_model,
@@ -661,6 +700,7 @@ class VirtualONVIFCamera:
             'physicalOnvifPort': self.physical_onvif_port,
             'onvifForwardingUsername': self.onvif_forwarding_username,
             'onvifForwardingPassword': self.onvif_forwarding_password,
+            'deviceControl': self.device_control,
             'eventSource': self.event_source,
             'aiTargets': self.ai_targets,
             'aiModel': self.ai_model,

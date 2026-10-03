@@ -1,5 +1,6 @@
 
 import json
+import re
 import time
 import socket
 import struct
@@ -14,6 +15,7 @@ import tempfile
 import queue
 from urllib.parse import quote
 from .ffmpeg_manager import FFmpegManager
+from .onvif_control import ControlServices, soap_op, fault as control_fault
 
 class VirtualSubscription:
     def __init__(self, sub_id, client_ip=None):
@@ -47,6 +49,7 @@ class ONVIFService:
         # Prevents repetitive 401 challenges for recently authenticated clients (30 min TTL)
         self.auth_cache = {}
         self.subscriptions = {}
+        self.controls = ControlServices(self)
         
     def create_app(self):
         """Create the Flask app for ONVIF service"""
@@ -154,34 +157,35 @@ class ONVIFService:
                 if request.method == 'GET':
                     return self._get_device_wsdl()
                 
-                # Parse SOAP request
+                # Parse SOAP request. Dispatch on the exact operation name (the
+                # first element in the Body); substring matching collides once
+                # operations share prefixes (GetRelayOutputs/GetRelayOutputOptions...).
                 soap_body = request.data.decode('utf-8')
-                
-                # GetDeviceInformation
-                if 'GetDeviceInformation' in soap_body:
+                op = soap_op(soap_body)
+
+                if op == 'GetDeviceInformation':
                     return self._handle_get_device_info()
-                
-                # GetCapabilities
-                elif 'GetCapabilities' in soap_body:
+                elif op == 'GetCapabilities':
                     return self._handle_get_capabilities(local_ip)
-                
-                # GetServices
-                elif 'GetServices' in soap_body:
+                elif op == 'GetServices':
                     return self._handle_get_services(local_ip)
-                
-                # GetSystemDateAndTime
-                elif 'GetSystemDateAndTime' in soap_body:
+                elif op == 'GetSystemDateAndTime':
                     return self._handle_get_system_date_time()
-                
-                # GetScopes
-                elif 'GetScopes' in soap_body:
+                elif op == 'GetScopes':
                     return self._handle_get_scopes()
-                
-                # GetNetworkInterfaces
-                elif 'GetNetworkInterfaces' in soap_body:
+                elif op == 'GetNetworkInterfaces':
                     return self._handle_get_network_interfaces()
-                
-                # Default response
+                elif op == 'GetServiceCapabilities':
+                    return self._handle_get_device_service_capabilities()
+                elif op in ('GetRelayOutputs', 'SetRelayOutputState', 'SetRelayOutputSettings'):
+                    self.controls.log('Device', op)
+                    resp = self.controls.handle_relay_op(op, soap_body, 'device')
+                    return resp if resp is not None else control_fault()
+
+                # Unknown operation: keep the historical GetDeviceInformation reply
+                # (NVR adoption flows have only ever been tested against it), but log
+                # it so any operation an NVR actually relies on can be implemented.
+                print(f"  [ONVIF ({self.camera.name})] Unhandled device operation '{op}' from {request.remote_addr}")
                 return self._handle_get_device_info()
                 
             except Exception as e:
@@ -388,7 +392,27 @@ class ONVIFService:
                 import traceback
                 traceback.print_exc()
                 return Response("Internal Server Error", status=500)
-                
+
+        # ONVIF PTZ / Imaging / DeviceIO services (see onvif_control.py).
+        # Accept the alternative paths other implementations use too.
+        @app.route('/onvif/ptz_service', methods=['POST'], endpoint=f'ptz_service_{self.camera.id}')
+        @app.route('/onvif/PTZ', methods=['POST'], endpoint=f'ptz_service_alt_{self.camera.id}')
+        @require_auth
+        def ptz_service():
+            return self.controls.handle_ptz(request.data.decode('utf-8', errors='replace'))
+
+        @app.route('/onvif/imaging_service', methods=['POST'], endpoint=f'imaging_service_{self.camera.id}')
+        @app.route('/onvif/Imaging', methods=['POST'], endpoint=f'imaging_service_alt_{self.camera.id}')
+        @require_auth
+        def imaging_service():
+            return self.controls.handle_imaging(request.data.decode('utf-8', errors='replace'))
+
+        @app.route('/onvif/deviceio_service', methods=['POST'], endpoint=f'deviceio_service_{self.camera.id}')
+        @app.route('/onvif/DeviceIO', methods=['POST'], endpoint=f'deviceio_service_alt_{self.camera.id}')
+        @require_auth
+        def deviceio_service():
+            return self.controls.handle_deviceio(request.data.decode('utf-8', errors='replace'))
+
         return app
 
     def start_discovery_service(self, local_ip):
@@ -512,6 +536,22 @@ class ONVIFService:
 
     def _handle_get_capabilities(self, local_ip):
         """Handle GetCapabilities request"""
+        base = f"http://{local_ip}:{self.camera.onvif_port}"
+        relay_count = self.controls.relay_count()
+        imaging_xml = (f"""<tt:Imaging>
+                    <tt:XAddr>{base}/onvif/imaging_service</tt:XAddr>
+                </tt:Imaging>""" if self.controls.has_imaging() else "")
+        ptz_xml = self.controls.capabilities_ptz_xml(base)
+        deviceio_xml = (f"""<tt:Extension>
+                    <tt:DeviceIO>
+                        <tt:XAddr>{base}/onvif/deviceio_service</tt:XAddr>
+                        <tt:VideoSources>1</tt:VideoSources>
+                        <tt:VideoOutputs>0</tt:VideoOutputs>
+                        <tt:AudioSources>{1 if getattr(self.camera, 'enable_audio', False) else 0}</tt:AudioSources>
+                        <tt:AudioOutputs>0</tt:AudioOutputs>
+                        <tt:RelayOutputs>{relay_count}</tt:RelayOutputs>
+                    </tt:DeviceIO>
+                </tt:Extension>""" if relay_count else "")
         soap_response = f"""<?xml version="1.0" encoding="UTF-8"?>
 <SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope"
                    xmlns:tds="http://www.onvif.org/ver10/device/wsdl"
@@ -546,7 +586,7 @@ class ONVIFService:
                     </tt:System>
                     <tt:IO>
                         <tt:InputConnectors>0</tt:InputConnectors>
-                        <tt:RelayOutputs>0</tt:RelayOutputs>
+                        <tt:RelayOutputs>{relay_count}</tt:RelayOutputs>
                     </tt:IO>
                     <tt:Security>
                         <tt:TLS1.1>false</tt:TLS1.1>
@@ -565,9 +605,7 @@ class ONVIFService:
                     <tt:WSPullPointSupport>true</tt:WSPullPointSupport>
                     <tt:WSPausableSubscriptionManagerInterfaceSupport>false</tt:WSPausableSubscriptionManagerInterfaceSupport>
                 </tt:Events>
-                <tt:Imaging>
-                    <tt:XAddr>http://{local_ip}:{self.camera.onvif_port}/onvif/imaging_service</tt:XAddr>
-                </tt:Imaging>
+                {imaging_xml}
                 <tt:Media>
                     <tt:XAddr>http://{local_ip}:{self.camera.onvif_port}/onvif/media_service</tt:XAddr>
                     <tt:StreamingCapabilities>
@@ -583,16 +621,8 @@ class ONVIFService:
                         </tt:ProfileCapabilities>
                     </tt:Extension>
                 </tt:Media>
-                <tt:Extension>
-                    <tt:DeviceIO>
-                        <tt:XAddr>http://{local_ip}:{self.camera.onvif_port}/onvif/deviceio_service</tt:XAddr>
-                        <tt:VideoSources>1</tt:VideoSources>
-                        <tt:VideoOutputs>0</tt:VideoOutputs>
-                        <tt:AudioSources>{1 if getattr(self.camera, 'enable_audio', False) else 0}</tt:AudioSources>
-                        <tt:AudioOutputs>0</tt:AudioOutputs>
-                        <tt:RelayOutputs>0</tt:RelayOutputs>
-                    </tt:DeviceIO>
-                </tt:Extension>
+                {ptz_xml}
+                {deviceio_xml}
             </tds:Capabilities>
         </tds:GetCapabilitiesResponse>
     </SOAP-ENV:Body>
@@ -602,6 +632,9 @@ class ONVIFService:
 
     def _handle_get_services(self, local_ip):
         """Handle GetServices request"""
+        m = re.search(r'IncludeCapability[^>]*>([^<]*)<', request.data.decode('utf-8', 'replace'))
+        include_caps = bool(m) and m.group(1).strip().lower() == 'true'
+        control_services = self.controls.services_xml(f"http://{local_ip}:{self.camera.onvif_port}", include_caps)
         soap_response = f"""<?xml version="1.0" encoding="UTF-8"?>
 <SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope"
                    xmlns:tds="http://www.onvif.org/ver10/device/wsdl">
@@ -631,10 +664,29 @@ class ONVIFService:
                     <tt:Minor xmlns:tt="http://www.onvif.org/ver10/schema">5</tt:Minor>
                 </tds:Version>
             </tds:Service>
+            {control_services}
         </tds:GetServicesResponse>
     </SOAP-ENV:Body>
 </SOAP-ENV:Envelope>"""
         
+        return Response(soap_response, mimetype='application/soap+xml')
+
+    def _handle_get_device_service_capabilities(self):
+        """Device service GetServiceCapabilities."""
+        soap_response = """<?xml version="1.0" encoding="UTF-8"?>
+<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope"
+                   xmlns:tds="http://www.onvif.org/ver10/device/wsdl">
+    <SOAP-ENV:Body>
+        <tds:GetServiceCapabilitiesResponse>
+            <tds:Capabilities>
+                <tds:Network IPFilter="false" ZeroConfiguration="false" IPVersion6="false" DynDNS="false"/>
+                <tds:Security UsernameToken="true" HttpDigest="false"/>
+                <tds:System DiscoveryResolve="false" DiscoveryBye="false" RemoteDiscovery="false" SystemBackup="false"
+                            SystemLogging="false" FirmwareUpgrade="false"/>
+            </tds:Capabilities>
+        </tds:GetServiceCapabilitiesResponse>
+    </SOAP-ENV:Body>
+</SOAP-ENV:Envelope>"""
         return Response(soap_response, mimetype='application/soap+xml')
 
     def _handle_get_system_date_time(self):
@@ -810,6 +862,7 @@ class ONVIFService:
                     </tt:H264>
                 </tt:VideoEncoderConfiguration>
                 {audio_main if getattr(self.camera, 'enable_audio', False) else ""}
+                {self.controls.profile_ptz_xml()}
             </trt:Profiles>
         """
         
@@ -843,6 +896,7 @@ class ONVIFService:
                     </tt:H264>
                 </tt:VideoEncoderConfiguration>
                 {audio_sub if getattr(self.camera, 'enable_audio', False) else ""}
+                {self.controls.profile_ptz_xml()}
             </trt:Profiles>
             """
         
@@ -1220,6 +1274,7 @@ class ONVIFService:
                         <tt:H264Profile>{h264_profile}</tt:H264Profile>
                     </tt:H264>
                 </tt:VideoEncoderConfiguration>
+                {self.controls.profile_ptz_xml()}
             </trt:Profile>
         </trt:GetProfileResponse>
     </SOAP-ENV:Body>
@@ -1400,6 +1455,8 @@ class ONVIFService:
             f"onvif://www.onvif.org/hardware/{self.camera.mac_address.replace(':', '').upper()}",
             f"onvif://www.onvif.org/location/Home"
         ]
+        if self.controls.control.ptz:
+            scopes.append("onvif://www.onvif.org/type/ptz")
         
         scope_xml = ""
         for s in scopes:
@@ -1528,6 +1585,24 @@ class ONVIFService:
                 
             timestamp = escape(evt.get('timestamp', datetime.utcnow().isoformat() + 'Z'))
             
+            if evt.get('relay_token'):
+                # tns1:Device/Trigger/Relay: Source RelayToken, Data LogicalState active|inactive
+                logical = 'active' if str(evt.get('value')).lower() in ('active', 'true', '1', 'on') else 'inactive'
+                messages_xml += f"""<wsnt:NotificationMessage>
+                <wsnt:Topic Dialect="http://www.onvif.org/ver10/tev/topicExpression/ConcreteSet">tns1:Device/Trigger/Relay</wsnt:Topic>
+                <wsnt:Message>
+                    <tt:Message UtcTime="{timestamp}" PropertyOperation="Changed">
+                        <tt:Source>
+                            <tt:SimpleItem Name="RelayToken" Value="{escape(str(evt['relay_token']))}"/>
+                        </tt:Source>
+                        <tt:Data>
+                            <tt:SimpleItem Name="LogicalState" Value="{logical}"/>
+                        </tt:Data>
+                    </tt:Message>
+                </wsnt:Message>
+            </wsnt:NotificationMessage>"""
+                continue
+
             messages_xml += f"""<wsnt:NotificationMessage>
                 <wsnt:Topic Dialect="http://www.onvif.org/ver10/tev/topicExpression/ConcreteSet">{topic}</wsnt:Topic>
                 <wsnt:Message>
@@ -1635,6 +1710,7 @@ class ONVIFService:
                         </tt:Motion>
                     </tt:CellMotionDetector>
                 </tt:RuleEngine>
+                {self.controls.event_topics_xml()}
             </tet:TopicSet>
         </tet:GetEventPropertiesResponse>
     </SOAP-ENV:Body>

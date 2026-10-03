@@ -3077,4 +3077,8 @@ def create_web_app(manager):
                 'log': apprise_installer.log
             })
 
+    # Physical-device control: Protect webhook endpoints + settings API
+    from .control_api import register as register_control_api
+    register_control_api(app, manager, login_required)
+
     return app
