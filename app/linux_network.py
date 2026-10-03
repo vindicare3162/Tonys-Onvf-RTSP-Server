@@ -81,10 +81,17 @@ class LinuxNetworkManager:
             _stdout = None if debug_mode else subprocess.DEVNULL
             _stderr = None if debug_mode else subprocess.DEVNULL
 
+            # sysctl's dotted key syntax uses "." as a hierarchy separator, so an
+            # interface name that itself contains a dot (any VLAN sub-interface,
+            # e.g. "bond0.2") must have that dot escaped as "/" within the key -
+            # otherwise sysctl misreads "net.ipv4.conf.bond0.2.arp_ignore" as
+            # path net/ipv4/conf/bond0/2/arp_ignore, which doesn't exist, and
+            # silently no-ops instead of protecting the parent interface at all.
+            parent_key = parent_if.replace('.', '/')
             subprocess.run(['sudo', 'sysctl', '-w', f'net.ipv4.conf.{name}.arp_ignore=1'], stdout=_stdout, stderr=_stderr, check=False)
             subprocess.run(['sudo', 'sysctl', '-w', f'net.ipv4.conf.{name}.arp_announce=2'], stdout=_stdout, stderr=_stderr, check=False)
-            subprocess.run(['sudo', 'sysctl', '-w', f'net.ipv4.conf.{parent_if}.arp_ignore=1'], stdout=_stdout, stderr=_stderr, check=False)
-            subprocess.run(['sudo', 'sysctl', '-w', f'net.ipv4.conf.{parent_if}.arp_announce=2'], stdout=_stdout, stderr=_stderr, check=False)
+            subprocess.run(['sudo', 'sysctl', '-w', f'net.ipv4.conf.{parent_key}.arp_ignore=1'], stdout=_stdout, stderr=_stderr, check=False)
+            subprocess.run(['sudo', 'sysctl', '-w', f'net.ipv4.conf.{parent_key}.arp_announce=2'], stdout=_stdout, stderr=_stderr, check=False)
             subprocess.run(['sudo', 'sysctl', '-w', 'net.ipv4.conf.all.arp_ignore=1'], stdout=_stdout, stderr=_stderr, check=False)
             subprocess.run(['sudo', 'sysctl', '-w', 'net.ipv4.conf.all.arp_announce=2'], stdout=_stdout, stderr=_stderr, check=False)
             
@@ -112,8 +119,14 @@ class LinuxNetworkManager:
                         f.write('    request subnet-mask, broadcast-address, time-offset, host-name, interface-mtu;\n')
                         f.write('}\n')
 
-                    # Clean up any stale PIDs or leases
-                    subprocess.run(['sudo', 'dhclient', '-r', name], check=False, timeout=5)
+                    # Do NOT release the previous lease before requesting: dhclient keeps a
+                    # per-interface record in its lease file and will try to renew the same
+                    # address via DHCPREQUEST on its own. Releasing first frees the address
+                    # back to the DHCP server's pool for a brief window, and when multiple
+                    # virtual NICs come up together (e.g. on a container restart) another
+                    # camera's concurrent DHCP request can grab it before this one gets it
+                    # back, swapping IPs between cameras and confusing anything (like UniFi
+                    # Protect) that identifies a camera by its address.
                     # Run with custom config
                     subprocess.run(['sudo', 'dhclient', '-1', '-nw', '-cf', conf_path, name], check=False)
                     
