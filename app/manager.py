@@ -1162,12 +1162,39 @@ class CameraManager:
             
             time.sleep(15) # Check every 15 seconds
 
+    def _reload_mediamtx_path(self, path_name):
+        """Force MediaMTX to drop and recreate a single path's source connection
+        via its own runtime config API, without restarting the shared server.
+
+        Restarting the whole MediaMTX process to recover one unhealthy camera
+        used to tear down every other camera's RTSP connection as collateral
+        damage - an NVR watching a perfectly healthy camera would see it
+        report a lost connection every time an unrelated camera's stream had
+        a problem. MediaMTX's own API lets a single path be torn down and
+        re-added in place instead.
+        """
+        base = "http://localhost:9997/v3/config/paths"
+        try:
+            resp = requests.get(f"{base}/get/{path_name}", timeout=5)
+            if resp.status_code != 200:
+                return False
+            config = resp.json()
+            requests.post(f"{base}/remove/{path_name}", timeout=5)
+            requests.post(f"{base}/add/{path_name}", json=config, timeout=5)
+            return True
+        except Exception as e:
+            print(f"  Watchdog: failed to reload MediaMTX path '{path_name}': {e}")
+            return False
+
     def _check_stream_health(self):
         """Check for hung or disconnected streams and perform recovery"""
         analytics = self.analytics.get_analytics()
         now = time.time()
         restart_needed = False
         stale_reasons = []
+        stale_paths = []
+        stale_cameras = set()
+        grid_fusion_stale = False
 
         # 1. Check all cameras that should be running
         for camera in self.cameras:
@@ -1176,27 +1203,29 @@ class CameraManager:
                 for suffix in ["_main", "_sub"]:
                     path_name = f"{camera.path_name}{suffix}"
                     stats = analytics.get(path_name)
-                    
+
                     if not stats:
                         # Path not even found in MediaMTX yet
                         if path_name not in self.stale_path_times:
                             self.stale_path_times[path_name] = now
                         continue
-                    
+
                     # v1.17+ uses 'online'; 'ready' is kept as a backwards-compat alias
                     is_online = stats.get('online', stats.get('ready', False))
                     is_stale = stats.get('stale', False)
-                    
+
                     # If not online, or online but stale (sending 0 bytes)
                     if not is_online or is_stale:
                         if path_name not in self.stale_path_times:
                             self.stale_path_times[path_name] = now
-                        
+
                         stale_duration = now - self.stale_path_times[path_name]
                         if stale_duration > 120: # 120 seconds (2 mins) to allow for camera reboots/network hiccups
                             print(f"Watchdog Alert: Camera path '{path_name}' ({camera.name}) has been dead/stale for {stale_duration:.0f}s.")
                             restart_needed = True
                             stale_reasons.append(f"{camera.name} ({suffix})")
+                            stale_paths.append(path_name)
+                            stale_cameras.add(camera.id)
                     else:
                         # Path is healthy, clear stale marker
                         if path_name in self.stale_path_times:
@@ -1218,29 +1247,47 @@ class CameraManager:
                 if not stats.get('online', stats.get('ready', False)):
                     if layout_id not in self.stale_path_times:
                         self.stale_path_times[layout_id] = now
-                    
+
                     stale_duration = now - self.stale_path_times[layout_id]
                     if stale_duration > 60:
                         print(f"Watchdog Alert: GridFusion '{layout_id}' is not ready.")
                         restart_needed = True
                         stale_reasons.append(f"GridFusion:{layout_id}")
+                        grid_fusion_stale = True
                 else:
                     if layout_id in self.stale_path_times:
                         del self.stale_path_times[layout_id]
 
         if restart_needed:
-            print(f"Watchdog: Recovery triggered for {', '.join(stale_reasons)}. Restarting MediaMTX...")
-            rtsp_user = self.global_username if getattr(self, 'rtsp_auth_enabled', False) else ''
-            rtsp_pass = self.global_password if getattr(self, 'rtsp_auth_enabled', False) else ''
-            self.mediamtx.restart(
-                self.cameras, 
-                self.rtsp_port, 
-                rtsp_user, 
-                rtsp_pass, 
-                self.get_grid_fusion(), 
-                debug_mode=self.debug_mode, 
-                advanced_settings=self.advanced_settings
-            )
-            # Clear all stale trackers after restart to give them time to come back
-            self.stale_path_times.clear()
-            time.sleep(30) # Grace period after restart
+            running_camera_count = sum(1 for c in self.cameras if c.status == "running") or 1
+            # A single (or small minority of) camera(s) going stale is handled by
+            # reloading just their MediaMTX paths in place, so a problem with one
+            # camera doesn't tear down every other camera's connection as
+            # collateral damage. Only fall back to restarting the whole shared
+            # MediaMTX process when GridFusion itself is involved (it isn't a
+            # single independent path) or when enough cameras are stale at once
+            # that it looks like a systemic MediaMTX-level problem rather than
+            # one camera's own issue.
+            if not grid_fusion_stale and len(stale_cameras) <= max(1, running_camera_count // 2):
+                print(f"Watchdog: Recovery triggered for {', '.join(stale_reasons)}. Reloading affected MediaMTX path(s) only...")
+                for path_name in stale_paths:
+                    self._reload_mediamtx_path(path_name)
+                for path_name in stale_paths:
+                    self.stale_path_times.pop(path_name, None)
+                time.sleep(5)
+            else:
+                print(f"Watchdog: Recovery triggered for {', '.join(stale_reasons)}. Restarting MediaMTX...")
+                rtsp_user = self.global_username if getattr(self, 'rtsp_auth_enabled', False) else ''
+                rtsp_pass = self.global_password if getattr(self, 'rtsp_auth_enabled', False) else ''
+                self.mediamtx.restart(
+                    self.cameras,
+                    self.rtsp_port,
+                    rtsp_user,
+                    rtsp_pass,
+                    self.get_grid_fusion(),
+                    debug_mode=self.debug_mode,
+                    advanced_settings=self.advanced_settings
+                )
+                # Clear all stale trackers after restart to give them time to come back
+                self.stale_path_times.clear()
+                time.sleep(30) # Grace period after restart
