@@ -9,6 +9,7 @@ import requests
 import xml.etree.ElementTree as ET
 from datetime import datetime
 import os
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from werkzeug.serving import make_server, ThreadedWSGIServer
 from .config import (
@@ -209,6 +210,14 @@ class VirtualONVIFCamera:
         self._event_forwarding_thread = None
         self._event_forwarding_running = False
         self.event_logs = []
+
+        # Background snapshot cache - see start_snapshot_cache() for why this
+        # exists instead of capturing on-demand per request.
+        self._snapshot_cache_thread = None
+        self._snapshot_cache_running = False
+        self._cached_snapshot_bytes = None
+        self._cached_snapshot_time = 0
+        self._snapshot_cache_lock = threading.Lock()
         
         # AI Event Detection settings
         self.event_source = config.get('eventSource', 'onvif')  # 'onvif' or 'ai'
@@ -328,6 +337,8 @@ class VirtualONVIFCamera:
         threading.Thread(target=self._probe_source_streams, daemon=True,
                          name=f"probe-{self.path_name}").start()
 
+        self.start_snapshot_cache()
+
         if self.enable_event_forwarding:
             if self.event_source == 'ai':
                 self.onvif_subscription_active = False
@@ -397,6 +408,7 @@ class VirtualONVIFCamera:
     def stop(self):
         """Mark camera as stopped, shutdown ONVIF service, and cleanup networking"""
         self.status = "stopped"
+        self.stop_snapshot_cache()
         if self.enable_event_forwarding:
             self.stop_event_forwarding()
             self.stop_ai_detection()
@@ -740,6 +752,150 @@ class VirtualONVIFCamera:
         self.onvif_subscription_active = False
         self.onvif_subscription_error = "Event forwarding stopped"
         print(f"  [Camera ({self.name})] ONVIF event forwarder thread stopped.")
+
+    def start_snapshot_cache(self):
+        """Start the background snapshot refresh thread.
+
+        The ONVIF /onvif/snapshot endpoint used to capture a fresh frame on
+        every single request. For most cameras that's a sub-second operation,
+        but for a high-resolution stream (a 7680x2160 panoramic Reolink in
+        production) a cold ffmpeg + RTSP handshake took 5-7 seconds per
+        capture - dominated by process/session setup, not decode work, so
+        neither MediaMTX-relay nor a direct camera connection helped much.
+        Combined with an NVR (UniFi Protect) not even requesting the snapshot
+        until 10-17s after a motion event fired, the total event-to-thumbnail
+        latency landed at 15-26+ seconds, well past whatever window Protect
+        uses to decide a thumbnail is still worth linking to the event -
+        every request logged a clean 200, but no thumbnail was ever stored.
+        Refreshing a cached frame continuously in the background means a
+        request is answered instantly regardless of how slow the underlying
+        camera connection is, and gives a place to validate a capture before
+        it's ever served (see the size sanity check below).
+        """
+        self._snapshot_cache_running = True
+        self._snapshot_cache_thread = threading.Thread(target=self._snapshot_cache_loop, daemon=True)
+        self._snapshot_cache_thread.start()
+        print(f"  [Camera ({self.name})] Snapshot cache thread started.")
+
+    def stop_snapshot_cache(self):
+        """Stop the background snapshot refresh thread"""
+        self._snapshot_cache_running = False
+
+    def get_cached_snapshot(self):
+        """Return (bytes, age_seconds) for the most recently cached snapshot, or (None, None)"""
+        with self._snapshot_cache_lock:
+            data = self._cached_snapshot_bytes
+            ts = self._cached_snapshot_time
+        if data is None:
+            return None, None
+        return data, time.time() - ts
+
+    def _snapshot_cache_loop(self):
+        """Continuously refresh a cached snapshot in the background"""
+        from urllib.parse import quote
+        from .ffmpeg_manager import FFmpegManager
+        ffmpeg_mgr = FFmpegManager()
+
+        stream_path = f"{self.path_name}_main"
+        rtsp_port = self.rtsp_port
+        if getattr(self.manager, 'rtsp_auth_enabled', False):
+            user = quote(getattr(self.manager, 'global_username', 'admin'))
+            pw = quote(getattr(self.manager, 'global_password', 'admin'))
+            mediamtx_url = f"rtsp://{user}:{pw}@localhost:{rtsp_port}/{stream_path}"
+        else:
+            mediamtx_url = f"rtsp://localhost:{rtsp_port}/{stream_path}"
+
+        def grey_blob_signature(path):
+            """Return (is_grey, mean, stddev) for a captured JPEG.
+
+            This looks for the specific signature of a mid-GOP HEVC decode
+            failure rather than "low detail" in general. When ffmpeg's HEVC
+            decoder starts on a non-keyframe it synthesises the missing
+            reference pictures as flat mid-grey (sample value 128), so a bad
+            capture lands at a greyscale mean of ~130 with almost no variance:
+            29 bad captures across three 4K/8K cameras measured 130.0-130.8
+            mean and 0.6-9 stddev, while 25 clean captures measured 99-129
+            mean and 56-79 stddev. Checking the mean as well as the variance
+            is what stops a legitimately dark night-time IR frame (low
+            variance, but a low mean) from being rejected forever.
+            capture_snapshot() now waits for a keyframe, so this is a safety
+            net rather than the primary defence. Downscaled first since we
+            only need a statistic, not full resolution.
+            """
+            try:
+                from PIL import Image, ImageStat
+                img = Image.open(path).convert('L')
+                img.thumbnail((400, 400))
+                st = ImageStat.Stat(img)
+                mean, std = st.mean[0], st.stddev[0]
+                return (std < 35 and 115 < mean < 145), mean, std
+            except Exception:
+                return False, None, None  # can't validate - don't block a capture over it
+
+        grey_streak = 0
+        consecutive_failures = 0
+        while self._snapshot_cache_running:
+            fd, path = tempfile.mkstemp(suffix='.jpg')
+            os.close(fd)
+            try:
+                success, error = ffmpeg_mgr.capture_snapshot(mediamtx_url, path)
+                grey, mean, std = grey_blob_signature(path) if success else (False, None, None)
+                if not success or grey:
+                    # ffmpeg failed against MediaMTX, or the frame carries the grey-blob
+                    # signature: retry straight from the camera, bypassing the relay.
+                    retry_ok, retry_err = ffmpeg_mgr.capture_snapshot(self.main_stream_url, path)
+                    if retry_ok:
+                        success, error = True, None
+                        grey, mean, std = grey_blob_signature(path)
+                    elif not success:
+                        # Both main-stream captures failed outright: sub stream as a last
+                        # resort (wrong resolution beats no snapshot at all).
+                        error = retry_err
+                        if self.sub_stream_url and not getattr(self, 'disable_substream', False):
+                            success, error = ffmpeg_mgr.capture_snapshot(self.sub_stream_url, path)
+                if success and grey:
+                    # Still grey after the retry. Serve the main-resolution frame anyway
+                    # rather than fall back to the sub stream (wrong resolution makes
+                    # Protect flap the camera's resolution class) or serve nothing - a
+                    # genuinely flat scene would otherwise lock the cache out for good.
+                    # Logged so a real regression stays visible.
+                    grey_streak += 1
+                    if grey_streak == 1 or grey_streak % 10 == 0:
+                        print(f"  [Camera ({self.name})] Snapshot still carries the grey-frame signature after a direct-camera retry (mean={mean:.0f}, stddev={std:.1f}, streak={grey_streak}); serving it anyway")
+                elif success:
+                    grey_streak = 0
+                if success and os.path.getsize(path) < 1024:
+                    success, error = False, "capture produced an empty or truncated file"
+
+                if success:
+                    with open(path, 'rb') as f:
+                        data = f.read()
+                    data = _shrink_jpeg_if_needed(data, MAX_SNAPSHOT_BYTES, self.name)
+                    with self._snapshot_cache_lock:
+                        self._cached_snapshot_bytes = data
+                        self._cached_snapshot_time = time.time()
+                    consecutive_failures = 0
+                else:
+                    consecutive_failures += 1
+                    if consecutive_failures == 1 or consecutive_failures % 10 == 0:
+                        print(f"  [Camera ({self.name})] Snapshot cache refresh failed: {error}")
+            except Exception as e:
+                consecutive_failures += 1
+                if consecutive_failures == 1 or consecutive_failures % 10 == 0:
+                    print(f"  [Camera ({self.name})] Snapshot cache refresh error: {e}")
+            finally:
+                if os.path.exists(path):
+                    try: os.remove(path)
+                    except: pass
+
+            # With capture_snapshot() waiting for a keyframe, one capture costs
+            # connection setup plus up to one GOP (measured 3.5-5s on 4K/8K H.265
+            # cameras with a 2s GOP), so this yields a fresh frame every ~6-8s per
+            # camera - well inside the 10-17s UniFi Protect takes to request a
+            # thumbnail after a motion event - without pinning a decoder on each
+            # stream. Skipped frames aren't decoded, so the CPU cost per capture is
+            # essentially one keyframe decode plus one JPEG encode.
+            time.sleep(3)
 
     def _event_forwarding_loop(self):
         """Background thread loop to pull event notifications from physical camera"""
@@ -1491,6 +1647,51 @@ class VirtualONVIFCamera:
                     if tag in self._active_smart_tags:
                         self._active_smart_tags.remove(tag)
                         send_evt(topic, data_name, 'false', [tag])
+
+# UniFi Protect's internal gRPC transport caps inter-service messages at
+# exactly 4,194,304 bytes (4MB) - confirmed from Protect's own logs
+# ("RESOURCE_EXHAUSTED: Received message larger than max (X vs. 4194304)")
+# for a different, natively-adopted camera whose snapshots exceed it and
+# permanently fail with "Not supported for third party cameras". Our own
+# high-resolution camera captures regularly land at 4.8-5.1MB - comfortably
+# over that same limit - so this stays under it with real margin.
+MAX_SNAPSHOT_BYTES = 3_500_000
+
+
+def _shrink_jpeg_if_needed(data, max_bytes, camera_name=""):
+    """Recompress a captured JPEG in-memory if it exceeds max_bytes.
+
+    Runs against the already-captured local file, not the camera - no extra
+    RTSP round-trip, so this is fast even though the source capture wasn't.
+    """
+    if len(data) <= max_bytes:
+        return data
+    try:
+        from io import BytesIO
+        from PIL import Image
+        img = Image.open(BytesIO(data))
+        img.load()
+        for quality in (80, 65, 50, 35, 20):
+            buf = BytesIO()
+            img.save(buf, format='JPEG', quality=quality)
+            shrunk = buf.getvalue()
+            if len(shrunk) <= max_bytes:
+                print(f"  [Camera ({camera_name})] Snapshot recompressed {len(data)} -> {len(shrunk)} bytes (quality={quality}) to stay under Protect's gRPC limit")
+                return shrunk
+        # Quality reduction alone wasn't enough - scale the image down too.
+        for scale in (0.75, 0.5, 0.35):
+            resized = img.resize((max(1, int(img.width * scale)), max(1, int(img.height * scale))))
+            buf = BytesIO()
+            resized.save(buf, format='JPEG', quality=50)
+            shrunk = buf.getvalue()
+            if len(shrunk) <= max_bytes:
+                print(f"  [Camera ({camera_name})] Snapshot resized to {scale:.0%} -> {len(shrunk)} bytes to stay under Protect's gRPC limit")
+                return shrunk
+        return shrunk  # smallest attempt, even if still over - better than the original
+    except Exception as e:
+        print(f"  [Camera ({camera_name})] Failed to shrink oversized snapshot ({len(data)} bytes): {e}")
+        return data
+
 
 def get_ws_security_header(username, password, mode='digest'):
     if not username:

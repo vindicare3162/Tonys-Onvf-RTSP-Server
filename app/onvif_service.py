@@ -200,54 +200,57 @@ class ONVIFService:
         @app.route('/onvif/snapshot', methods=['GET'], endpoint=f'snapshot_{self.camera.id}')
         @require_auth
         def snapshot():
-            """Capture and return a real-time snapshot for ONVIF"""
-            # Capture from the MAIN stream so the snapshot dimensions match the
-            # advertised main resolution. Serving sub-resolution snapshots made
-            # NVRs (UniFi Protect) flap the camera's resolution class (issue #42).
-            stream_path = f"{self.camera.path_name}_main"
-            
-            # Construct local MediaMTX URL
-            rtsp_port = self.camera.rtsp_port
-            if getattr(self.camera.manager, 'rtsp_auth_enabled', False):
-                user = quote(getattr(self.camera.manager, 'global_username', 'admin'))
-                pw = quote(getattr(self.camera.manager, 'global_password', 'admin'))
-                stream_url = f"rtsp://{user}:{pw}@localhost:{rtsp_port}/{stream_path}"
-            else:
-                stream_url = f"rtsp://localhost:{rtsp_port}/{stream_path}"
-            
-            ffmpeg_mgr = FFmpegManager()
-            
-            # Create a temp file
-            fd, path = tempfile.mkstemp(suffix='.jpg')
-            os.close(fd)
-            
-            try:
-                success, error = ffmpeg_mgr.capture_snapshot(stream_url, path)
-                if not success:
-                    # Fallback to direct camera main URL if MediaMTX failed
-                    success, error = ffmpeg_mgr.capture_snapshot(self.camera.main_stream_url, path)
-                if not success and self.camera.sub_stream_url and not getattr(self.camera, 'disable_substream', False):
-                    # Last resort: sub stream (wrong resolution beats no snapshot)
-                    success, error = ffmpeg_mgr.capture_snapshot(self.camera.sub_stream_url, path)
-                
-                if success:
-                    with open(path, 'rb') as f:
-                        content = f.read()
-                    
-                    from flask import make_response
-                    response = make_response(content)
-                    response.headers['Content-Type'] = 'image/jpeg'
-                    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
-                    return response
+            """Return the most recently cached snapshot for this camera.
+
+            This used to capture a fresh frame per request, but for a
+            high-resolution stream that took 5-7 seconds (ffmpeg/RTSP session
+            setup, not decode), and combined with an NVR not requesting the
+            snapshot until well after a motion event fired, thumbnails were
+            arriving too late to ever get linked to their event - see
+            camera.py's start_snapshot_cache() for the full story. A
+            background thread there keeps this cache warm continuously, so
+            this just serves whatever's already available.
+            """
+            data, age = self.camera.get_cached_snapshot()
+
+            if data is None:
+                # Cache hasn't populated yet (camera just started) - fall
+                # back to a one-off live capture rather than fail outright.
+                stream_path = f"{self.camera.path_name}_main"
+                rtsp_port = self.camera.rtsp_port
+                if getattr(self.camera.manager, 'rtsp_auth_enabled', False):
+                    user = quote(getattr(self.camera.manager, 'global_username', 'admin'))
+                    pw = quote(getattr(self.camera.manager, 'global_password', 'admin'))
+                    stream_url = f"rtsp://{user}:{pw}@localhost:{rtsp_port}/{stream_path}"
                 else:
-                    return Response(f"Snapshot capture failed: {error}", status=500)
-                    
-            except Exception as e:
-                return Response(f"Error: {str(e)}", status=500)
-            finally:
-                if os.path.exists(path):
-                    try: os.remove(path)
-                    except: pass
+                    stream_url = f"rtsp://localhost:{rtsp_port}/{stream_path}"
+
+                ffmpeg_mgr = FFmpegManager()
+                fd, path = tempfile.mkstemp(suffix='.jpg')
+                os.close(fd)
+                try:
+                    success, error = ffmpeg_mgr.capture_snapshot(self.camera.main_stream_url, path)
+                    if not success:
+                        success, error = ffmpeg_mgr.capture_snapshot(stream_url, path)
+                    if not success and self.camera.sub_stream_url and not getattr(self.camera, 'disable_substream', False):
+                        success, error = ffmpeg_mgr.capture_snapshot(self.camera.sub_stream_url, path)
+
+                    if not success:
+                        return Response(f"Snapshot capture failed: {error}", status=500)
+                    with open(path, 'rb') as f:
+                        data = f.read()
+                except Exception as e:
+                    return Response(f"Error: {str(e)}", status=500)
+                finally:
+                    if os.path.exists(path):
+                        try: os.remove(path)
+                        except: pass
+
+            from flask import make_response
+            response = make_response(data)
+            response.headers['Content-Type'] = 'image/jpeg'
+            response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+            return response
 
         # ONVIF Media Service
         @app.route('/onvif/media_service', methods=['GET', 'POST'], endpoint=f'media_service_{self.camera.id}')
