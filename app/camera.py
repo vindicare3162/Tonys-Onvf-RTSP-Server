@@ -5,6 +5,7 @@ import time
 import uuid
 import hashlib
 import queue
+import random
 import requests
 import xml.etree.ElementTree as ET
 from datetime import datetime
@@ -943,11 +944,16 @@ class VirtualONVIFCamera:
                 # 2. Get events service XAddr
                 events_xaddr = None
                 try:
-                    caps = mycam.devicemgmt.GetCapabilities(Category=['Events', 'All'])
+                    # zeep's generated binding expects the request body as a single dict
+                    # argument matching the WSDL message shape, not a `Category=` keyword -
+                    # the keyword form always raised TypeError and silently fell through to
+                    # the GetServices fallback (and finally the guessed URL below) on every
+                    # single call, meaning the camera's authoritative XAddr was never used.
+                    caps = mycam.devicemgmt.GetCapabilities({'Category': 'All'})
                     events_xaddr = caps.Events.XAddr
                 except Exception:
                     try:
-                        services = mycam.devicemgmt.GetServices(IncludeCapability=False)
+                        services = mycam.devicemgmt.GetServices({'IncludeCapability': False})
                         for s in services:
                             if 'events' in s.Namespace.lower():
                                 events_xaddr = s.XAddr
@@ -968,6 +974,13 @@ class VirtualONVIFCamera:
                 for mode in auth_modes:
                     try:
                         sec_header = get_ws_security_header(username, password, mode=mode)
+                        # Explicitly request a long-lived subscription. Without an
+                        # InitialTerminationTime, some cameras (observed with a Reolink
+                        # Elite Pro Floodlight) fall back to a very short default lifetime
+                        # (~15-20s), which then expires mid-poll-loop: every PullMessages
+                        # call against the now-dead subscription returns HTTP 400, forcing
+                        # a teardown/recreate cycle every ~15s and effectively preventing
+                        # any camera motion event from ever being reliably retrieved.
                         sub_payload = f"""<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope" xmlns:wsa="http://www.w3.org/2005/08/addressing" xmlns:tet="http://www.onvif.org/ver10/events/wsdl">
                           <soap:Header>
                             <wsa:Action>http://www.onvif.org/ver10/events/wsdl/EventPortType/CreatePullPointSubscriptionRequest</wsa:Action>
@@ -975,7 +988,9 @@ class VirtualONVIFCamera:
                             {sec_header}
                           </soap:Header>
                           <soap:Body>
-                            <tet:CreatePullPointSubscription/>
+                            <tet:CreatePullPointSubscription>
+                              <tet:InitialTerminationTime>PT1H</tet:InitialTerminationTime>
+                            </tet:CreatePullPointSubscription>
                           </soap:Body>
                         </soap:Envelope>"""
                         
@@ -1016,14 +1031,18 @@ class VirtualONVIFCamera:
                     self.onvif_subscription_active = False
                     if subscription_limit_hit:
                         self.onvif_subscription_error = "Maximum concurrent ONVIF subscription limit reached on physical camera."
-                        print(f"  [ONVIF Event Forwarder ({self.name})] Camera '{self.name}' is at its max concurrent ONVIF subscription limit. Another client is using the slot. Waiting 30s for a slot to free up...")
-                        time.sleep(30)
+                        # Jitter here too: when two virtual cameras share one physical camera's
+                        # subscription slot, a fixed 30s wait keeps both retrying in lockstep.
+                        wait = 30 + random.uniform(0, 10)
+                        print(f"  [ONVIF Event Forwarder ({self.name})] Camera '{self.name}' is at its max concurrent ONVIF subscription limit. Another client is using the slot. Waiting {wait:.0f}s for a slot to free up...")
+                        time.sleep(wait)
                         continue
                     self.onvif_subscription_error = f"Subscription creation failed: {last_err}"
                     raise Exception(f"Subscription creation failed across all auth modes. Last error: {last_err}")
-                
+
                 self.onvif_subscription_active = True
                 self.onvif_subscription_error = None
+                self._event_retry_delay = 10  # reset backoff after a successful subscription
                 print(f"  [ONVIF Event Forwarder ({self.name})] Subscription created using auth mode '{self.current_auth_mode}'. PullPoint address: {pullpoint_addr}")
                 
                 # Poll loop
@@ -1130,8 +1149,18 @@ class VirtualONVIFCamera:
             except Exception as conn_err:
                 self.onvif_subscription_active = False
                 self.onvif_subscription_error = f"ONVIF connection failed: {conn_err}"
-                print(f"  [ONVIF Event Forwarder ({self.name})] ONVIF events connection failed: {conn_err}. Retrying in 10s...")
-                time.sleep(10)
+                # Exponential backoff (capped, with jitter) instead of a fixed 10s retry.
+                # A fixed short retry means that when two virtual cameras share one physical
+                # camera (e.g. a dual-lens unit exposing one ONVIF service), both keep
+                # hammering the same auth endpoint in lockstep. Repeated failed/rapid auth
+                # attempts can trip a camera's own brute-force lockout, which then makes
+                # every subsequent attempt fail with a generic auth fault regardless of
+                # whether the credentials are correct - self-inflicted denial of service.
+                base_delay = getattr(self, '_event_retry_delay', 10)
+                delay = min(base_delay, 120) + random.uniform(0, 3)
+                self._event_retry_delay = min(base_delay * 2, 120)
+                print(f"  [ONVIF Event Forwarder ({self.name})] ONVIF events connection failed: {conn_err}. Retrying in {delay:.0f}s...")
+                time.sleep(delay)
 
     def start_ai_detection(self):
         """Start local AI event detection background thread"""
