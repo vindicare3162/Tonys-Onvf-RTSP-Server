@@ -108,7 +108,7 @@ How to drive things manually / from Protect Alarm Manager webhooks:
   light_on, light_off, siren_on[?seconds=N], siren_off, ir_on, ir_off, privacy_on,
   privacy_off, daynight_auto, daynight_day, daynight_night, ptz_preset/<token-or-name>,
   ptz_home, ptz_stop, ptz_move?x=&y=&seconds=, state, help.
-  Camera ids: 2 = Tapo Zoom, 3 = Reolink, 4 = Tapo Wide.
+  Camera ids: 2 = Tapo Zoom, 3 = Reolink, 4 = Tapo Wide, 5 = Reolink RLC-823S2 Backyard.
 - Change settings: `curl -X PUT -H 'Content-Type: application/json' -d '{...}'
   http://192.168.1.51:5552/api/cameras/<id>/device-control` (keys: backend, host, ptz
   {enabled,inProfile,profileToken,maxMoveSeconds}, relays [..], imaging, sirenSeconds,
@@ -135,11 +135,11 @@ Blocked on Ben (cannot be done autonomously):
 | Host | Unraid "Tower" 192.168.1.51, SSH as root |
 | Server repo / compose dir | `/mnt/user/appdata/onvif-rtsp` (clone of upstream at f15c604, only `docker-compose.yml` locally modified: nvidia runtime + unraid labels) |
 | Container | `onvif-rtsp-server`, host networking, `runtime: nvidia`, data bind-mounted from `./data` |
-| Image | `onvif-rtsp-onvif-rtsp-server:latest` **78ac74c07e64 — built 2026-10-03 10:27 AEST** with the fix. Previous: 23dc2441ce3d (stock, 2026-09-13), now dangling = rollback point. **Code is baked in at build time (COPY . .), so editing files on the host does nothing until `docker compose up -d --build`.** |
+| Image | `onvif-rtsp-onvif-rtsp-server:latest` **3e7a679b6f42 — built 2026-10-04 21:04 AEST** (Backyard PTZ/zoom + DHCP lease persistence; rollback chain 2f17219db1d1 → 42ab215b4bb8 → fca484046 2026-10-04 pre-Backyard). Earlier: 78ac74c07e64 built 2026-10-03 10:27 AEST with the fix. Previous: 23dc2441ce3d (stock, 2026-09-13), now dangling = rollback point. **Code is baked in at build time (COPY . .), so editing files on the host does nothing until `docker compose up -d --build`.** |
 | Web UI | http://192.168.1.51:5552 (no login) |
 | MediaMTX API | http://localhost:9997 on Tower (v3 API) |
-| Virtual cameras (vNICs on `bond0.2`, DHCP) | Tapo C575D Zoom → 192.168.2.158:8002 · Reolink Elite Pro Floodlight → 192.168.2.233:8003 · Tapo C575D Wide → 192.168.2.230:8004 |
-| Physical cameras | Tapo C575D 192.168.5.70 (stream6 = zoom 4K H265, stream1 = wide 4K H265) · Reolink 192.168.5.197 (Preview_01_main 7680x2160 H265) |
+| Virtual cameras (vNICs on `bond0.2`, DHCP) | Tapo C575D Zoom → 192.168.2.158:8002 · Reolink Elite Pro Floodlight → 192.168.2.233:8003 · Tapo C575D Wide → 192.168.2.230:8004 · Reolink RLC-823S2 Backyard → 192.168.2.212:8005. dhclient lease files persist in `data/dhcp/<vnic>.leases` (since 2026-10-04) so IPs survive container recreation |
+| Physical cameras | Tapo C575D 192.168.5.70 (stream6 = zoom 4K H265, stream1 = wide 4K H265) · Reolink 192.168.5.197 (Preview_01_main 7680x2160 H265) · Reolink RLC-823S2 "Backyard" 192.168.2.63 (PTZ+zoom, Preview_01_main 3840x2160 H265 25fps, sub 640x360 H264; ONVIF enabled on :8000 2026-10-04, was off) |
 | NVR | UniFi Protect "Fraser UNVR" 192.168.2.202. Polls `/onvif/snapshot` every ~15 s per camera and holds persistent RTSP readers on all 6 MediaMTX paths. |
 | ONVIF auth | HTTP Basic with `onvifUsername`/`onvifPassword` from `data/camera_config.json`, 30-min per-IP cache after first success |
 | Local repo | `F:\Projects\Tonys-Onvf-RTSP-Server`, remote = vindicare3162 fork of BigTonyTones upstream |
@@ -155,6 +155,31 @@ Files: `app/camera.py`, `app/ffmpeg_manager.py`, `app/linux_network.py`, `app/ma
 5. `linux_network.py`: escape dots in VLAN parent names for sysctl keys; don't `dhclient -r` before requesting (prevents IP swaps between vNICs on restart).
 
 ## Session log
+
+### 2026-10-04 (evening) — new camera: Reolink RLC-823S2 "Backyard" (192.168.2.63)
+- Same admin credentials as the other Reolink. ONVIF was disabled on the camera; enabled via
+  Reolink API `SetNetPort` (onvifEnable 1, port 8000). Abilities: PTZ (continuous pan/tilt +
+  zoom, 64 presets, ONVIF profile `000`), floodlight, siren, IR, AI tracking.
+- Added as camera id 5 via `POST /api/cameras`: vNIC `vnic_4acc7d45a5` MAC 02:D4:E5:D9:8E:AF on
+  bond0.2, ONVIF 8005, event forwarding from physical ONVIF :8000 (subscription works),
+  deviceControl = reolink + ptz enabled + relays Floodlight/Siren/IR_Illuminator + imaging,
+  sirenSeconds 10.
+- Code changes (uncommitted at time of writing, tests 119 pass):
+  - `controller.py`: `build_reolink` builds a `PtzController` over ONVIF when `ptz.enabled`
+    (Reolink HTTP ptzCtrl has no timed move); PTZ-enabled flag is in the Reolink device
+    signature so toggling it rebuilds.
+  - `onvif_control.py`: advertise continuous zoom (ContinuousZoomVelocitySpace, ZoomSpeedSpace,
+    defaults) when the physical node has it. Before this, zoom was forwarded but never offered.
+  - `linux_network.py`: **IP-swap root cause.** The first redeploy moved the adopted Floodlight
+    vNIC .233 -> .234 (and Backyard .213 -> .212): dhclient's lease file was inside the
+    container (lost on recreate) and `remove_interface` released leases (`dhclient -r`). Now
+    per-vNIC `-lf data/dhcp/<vnic>.leases` + `-pf /run/dhclient_<vnic>.pid`, and `-x` (stop
+    without release) on teardown. Lease files were seeded once by hand with .233 for the
+    Floodlight; the next recreate kept all four IPs.
+- Flaky pre-existing test: `test_discovery_ops_well_formed_and_local` occasionally sees a
+  `GetCapabilities` from the Tapo imaging probe thread after the log clear (1 in ~4 runs).
+- Ben to do: adopt "Reolink RLC-823S2 Backyard" in Protect (192.168.2.212), then test the
+  joystick + zoom. Consider UniFi DHCP reservations for the four vNIC MACs as belt and braces.
 
 ### 2026-10-04 — PTZ / lights / siren pass-through: discovery (no code changes)
 - Virtual cameras implement only device, media, snapshot and events. **No PTZ service.**
