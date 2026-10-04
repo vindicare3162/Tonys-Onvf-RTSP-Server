@@ -164,7 +164,7 @@ Files: `app/camera.py`, `app/ffmpeg_manager.py`, `app/linux_network.py`, `app/ma
   bond0.2, ONVIF 8005, event forwarding from physical ONVIF :8000 (subscription works),
   deviceControl = reolink + ptz enabled + relays Floodlight/Siren/IR_Illuminator + imaging,
   sirenSeconds 10.
-- Code changes (uncommitted at time of writing, tests 119 pass):
+- Code changes (committed 2c95aa4 PTZ/zoom, cfaab8b DHCP, d0b729f handover; not pushed; tests 119 pass):
   - `controller.py`: `build_reolink` builds a `PtzController` over ONVIF when `ptz.enabled`
     (Reolink HTTP ptzCtrl has no timed move); PTZ-enabled flag is in the Reolink device
     signature so toggling it rebuilds.
