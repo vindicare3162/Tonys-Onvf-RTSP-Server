@@ -4,6 +4,20 @@ import os
 import re
 import time
 
+from .config import DATA_DIR
+
+# dhclient state per vNIC. The lease file lives in the bind-mounted data dir so it
+# survives container recreation: dhclient then re-requests the same address
+# (INIT-REBOOT) and the vNIC keeps its IP, which UniFi Protect identifies it by.
+DHCP_STATE_DIR = os.path.join(DATA_DIR, 'dhcp')
+
+
+def _dhclient_files(name):
+    os.makedirs(DHCP_STATE_DIR, exist_ok=True)
+    return ['-lf', os.path.join(DHCP_STATE_DIR, f'{name}.leases'),
+            '-pf', f'/run/dhclient_{name}.pid']
+
+
 class LinuxNetworkManager:
     """Manages Linux network interfaces for virtual cameras"""
     
@@ -128,7 +142,8 @@ class LinuxNetworkManager:
                     # back, swapping IPs between cameras and confusing anything (like UniFi
                     # Protect) that identifies a camera by its address.
                     # Run with custom config
-                    subprocess.run(['sudo', 'dhclient', '-1', '-nw', '-cf', conf_path, name], check=False)
+                    subprocess.run(['sudo', 'dhclient', '-1', '-nw', '-cf', conf_path, *_dhclient_files(name), name],
+                                   check=False)
                     
                     # Wait up to 5 seconds for IP (most fast networks respond in 1-2s)
                     for _ in range(5):
@@ -162,7 +177,7 @@ class LinuxNetworkManager:
                 if not re.search(r'inet \d+', result.stdout):
                     try:
                         print(f"  Standard DHCP attempts failed. Trying plain 'dhclient' (User Success Mode)...")
-                        subprocess.run(['sudo', 'dhclient', '-nw', name], check=False)
+                        subprocess.run(['sudo', 'dhclient', '-nw', *_dhclient_files(name), name], check=False)
                         # Wait a bit
                         for _ in range(3):
                             result = subprocess.run(['ip', '-4', 'addr', 'show', name], capture_output=True, text=True)
@@ -208,9 +223,10 @@ class LinuxNetworkManager:
             
         print(f"Removing Virtual NIC {name}...")
         try:
-            # Release DHCP
+            # Stop this vNIC's dhclient without releasing the lease (-x, not -r): a
+            # released address can be handed to another client before we restart.
             try:
-                subprocess.run(['sudo', 'dhclient', '-r', name], check=False)
+                subprocess.run(['sudo', 'dhclient', '-x', *_dhclient_files(name), name], check=False)
             except:
                 pass
             # Delete link
