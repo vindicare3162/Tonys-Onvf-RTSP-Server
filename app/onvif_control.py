@@ -101,6 +101,14 @@ def _space(kind, xr=(-1, 1), yr=(-1, 1)):
             f'<tt:YRange><tt:Min>{yr[0]}</tt:Min><tt:Max>{yr[1]}</tt:Max></tt:YRange>')
 
 
+ZOOM_GENERIC = "http://www.onvif.org/ver10/tptz/ZoomSpaces"
+
+
+def _zoom_space(uri, xr=(-1, 1)):
+    return (f'<tt:URI>{ZOOM_GENERIC}/{uri}</tt:URI>'
+            f'<tt:XRange><tt:Min>{xr[0]}</tt:Min><tt:Max>{xr[1]}</tt:Max></tt:XRange>')
+
+
 class ControlServices:
     """Handlers bound to one ONVIFService / virtual camera."""
 
@@ -202,7 +210,10 @@ class ControlServices:
             parts.append(f'<tt:DefaultRelativePanTiltTranslationSpace>{GENERIC}/TranslationGenericSpace</tt:DefaultRelativePanTiltTranslationSpace>')
         if node['pan_tilt_continuous']:
             parts.append(f'<tt:DefaultContinuousPanTiltVelocitySpace>{GENERIC}/VelocityGenericSpace</tt:DefaultContinuousPanTiltVelocitySpace>')
-        parts.append(f'<tt:DefaultPTZSpeed><tt:PanTilt x="1" y="1" space="{GENERIC}/GenericSpeedSpace"/></tt:DefaultPTZSpeed>')
+        if node['zoom_continuous']:
+            parts.append(f'<tt:DefaultContinuousZoomVelocitySpace>{ZOOM_GENERIC}/VelocityGenericSpace</tt:DefaultContinuousZoomVelocitySpace>')
+        zoom_speed = f'<tt:Zoom x="1" space="{ZOOM_GENERIC}/ZoomGenericSpeedSpace"/>' if node['zoom_continuous'] else ''
+        parts.append(f'<tt:DefaultPTZSpeed><tt:PanTilt x="1" y="1" space="{GENERIC}/GenericSpeedSpace"/>{zoom_speed}</tt:DefaultPTZSpeed>')
         parts.append('<tt:DefaultPTZTimeout>PT5S</tt:DefaultPTZTimeout>')
         if node['pan_tilt_absolute']:
             parts.append(f'<tt:PanTiltLimits><tt:Range>{_space("abs")}</tt:Range></tt:PanTiltLimits>')
@@ -217,8 +228,12 @@ class ControlServices:
             s += f'<tt:RelativePanTiltTranslationSpace>{_space("rel")}</tt:RelativePanTiltTranslationSpace>'
         if node['pan_tilt_continuous']:
             s += f'<tt:ContinuousPanTiltVelocitySpace>{_space("cont")}</tt:ContinuousPanTiltVelocitySpace>'
+        if node['zoom_continuous']:
+            s += f'<tt:ContinuousZoomVelocitySpace>{_zoom_space("VelocityGenericSpace")}</tt:ContinuousZoomVelocitySpace>'
         s += (f'<tt:PanTiltSpeedSpace><tt:URI>{GENERIC}/GenericSpeedSpace</tt:URI>'
               '<tt:XRange><tt:Min>0</tt:Min><tt:Max>1</tt:Max></tt:XRange></tt:PanTiltSpeedSpace>')
+        if node['zoom_continuous']:
+            s += f'<tt:ZoomSpeedSpace>{_zoom_space("ZoomGenericSpeedSpace", (0, 1))}</tt:ZoomSpeedSpace>'
         return s
 
     def _node_xml(self, tag):

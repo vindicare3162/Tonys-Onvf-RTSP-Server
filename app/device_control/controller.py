@@ -376,6 +376,17 @@ def build_reolink(host, cam, dc):
             logger.info("Reolink %s initial state read failed: %s", host, e)
     threading.Thread(target=seed, daemon=True).start()
     ctl.imaging = ReolinkImaging(client)
+    # PTZ models (e.g. RLC-823S2) expose it over ONVIF only; the HTTP API's ptzCtrl
+    # has no timed/dead-man move. Built only when enabled: fixed Reolinks have no
+    # PTZ node and would just log probe failures.
+    ptz_cfg = dc.get('ptz') or {}
+    if ptz_cfg.get('enabled'):
+        onvif_host = host.rsplit(':', 1)[0] if host.count(':') == 1 else host
+        ctl.ptz = PtzController(onvif_host, cam.physical_onvif_port or 8000,
+                                cam.onvif_forwarding_username or cam.username,
+                                cam.onvif_forwarding_password or cam.password,
+                                profile_token=ptz_cfg.get('profileToken') or None,
+                                max_move_seconds=float(ptz_cfg.get('maxMoveSeconds', 30)))
     return ctl
 
 
@@ -470,8 +481,10 @@ class Registry:
         if not key:
             return None
         cloud_pw = self._cloud_password(dc) if backend == 'tapo' else ''
+        # A Reolink builds its PTZ worker only when enabled, so toggling it is device-level.
+        reolink_ptz = backend == 'reolink' and bool((dc.get('ptz') or {}).get('enabled'))
         device_sig = (cam.username, cam.password, cam.onvif_forwarding_username, cam.onvif_forwarding_password,
-                      cam.physical_onvif_port, cloud_pw)
+                      cam.physical_onvif_port, cloud_pw, reolink_ptz)
         with self._lock:
             entry = self._controllers.get(key)
             if entry and entry[0] == device_sig:

@@ -295,3 +295,50 @@ def test_not_yet_probed_receiver_fault(make_camera, onvif_client):
     r = c.ptz(f'<tptz:GetPresets><tptz:ProfileToken>{PROFILE}</tptz:ProfileToken></tptz:GetPresets>')
     assert fault_codes(r)[0] == 'SOAP-ENV:Receiver'
     assert time.time() - t0 < 3
+
+
+def test_reolink_ptz_over_onvif_when_enabled(make_camera, upstream, onvif_client):
+    """PTZ Reolinks (RLC-823S2) are driven over ONVIF on physical_onvif_port; the
+    device_control host carries the HTTP API port, which must not leak into ONVIF."""
+    cam = make_camera(device_control={'backend': 'reolink', 'host': f'127.0.0.1:{upstream.port}',
+                                      'ptz': {'enabled': True}},
+                      physical_onvif_port=upstream.port)
+    c = onvif_client(cam)
+    ptz = CameraControl(cam).ptz
+    assert ptz is not None
+    assert wait_for(lambda: ptz.probed, 5), ptz.last_error
+    upstream.log.clear()
+    assert c.ptz(cm(0.5, 0)).status_code == 200
+    # wait for the move upstream first: a Stop queued behind it would supersede it (latest wins)
+    assert wait_for(lambda: 'ContinuousMove' in ptz_ops(upstream), 3)
+    assert c.ptz(stop()).status_code == 200
+    assert wait_for(lambda: ptz_ops(upstream)[-1:] == ['Stop'], 3), ptz_ops(upstream)
+
+
+def test_reolink_without_ptz_has_no_worker_and_enabling_rebuilds(make_camera, upstream):
+    dc = {'backend': 'reolink', 'host': f'127.0.0.1:{upstream.port}'}
+    cam = make_camera(device_control=dict(dc), physical_onvif_port=upstream.port)
+    ctl = CameraControl(cam).ctl
+    assert ctl.ptz is None and CameraControl(cam).ptz is None
+    cam.device_control = dict(dc, ptz={'enabled': True})
+    ctl2 = CameraControl(cam).ctl
+    assert ctl2 is not ctl and ctl2.ptz is not None
+
+
+def test_zoom_advertised_and_forwarded_when_node_has_zoom(ptz_setup, upstream):
+    c, ptz = ptz_setup()
+    # pan/tilt-only node (Tapo): no zoom spaces at all
+    assert b'ZoomSpaces' not in c.ptz('<tptz:GetNodes/>').data
+    ptz.node['zoom_continuous'] = True        # e.g. Reolink RLC-823S2
+    for op in ('<tptz:GetNodes/>', '<tptz:GetConfigurations/>',
+               '<tptz:GetConfigurationOptions><tptz:ConfigurationToken>PTZConfig_7</tptz:ConfigurationToken>'
+               '</tptz:GetConfigurationOptions>'):
+        assert b'tptz/ZoomSpaces/' in c.ptz(op).data, op
+    assert b'<tt:ContinuousZoomVelocitySpace>' in c.ptz('<tptz:GetNodes/>').data
+    assert b'<tt:DefaultContinuousZoomVelocitySpace>' in c.ptz('<tptz:GetConfigurations/>').data
+    zoom_in = (f'<tptz:ContinuousMove><tptz:ProfileToken>{PROFILE}</tptz:ProfileToken><tptz:Velocity>'
+               '<tt:Zoom x="0.5"/></tptz:Velocity></tptz:ContinuousMove>')
+    assert c.ptz(zoom_in).status_code == 200
+    assert wait_for(lambda: upstream.entries('ContinuousMove'), 3)
+    assert '<tt:Zoom x="0.5000"' in upstream.entries('ContinuousMove')[0][3]
+    c.ptz(stop())
