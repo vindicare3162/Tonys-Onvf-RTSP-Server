@@ -82,12 +82,24 @@ Progress (update every iteration):
       Reolink SetRelayOutputState Floodlight active/inactive switched the real light;
       relay events arrived via PullMessages; imaging options/settings served for Reolink
       (IR ON/OFF/AUTO + sliders 0-255) and Tapo Wide (sliders 0-100).
-- [ ] QA re-review of the fixes (running)
-- [ ] Commit
-- [ ] **Ben: re-adopt Tapo Zoom and Reolink (and Wide) in Protect** - Protect caches
-      capabilities at adoption; until then it hasn't called any new service. After that, grep
-      the container log for `ONVIF Control` / `Unhandled device operation` to see exactly
-      what Protect uses, and adjust.
+- [x] QA re-review: 116 tests; 4 further issues fixed (stable HMAC key for lockout flags,
+      idle-connection reset before non-idempotent PTZ, bounded siren_off, Tapo siren always
+      stoppable). Suite 116/116. Redeployed; e2e re-run passed.
+- [x] Committed af21359 (feature), 4f0a631 (tests), 57f6c30 (handover). Not pushed.
+- [x] 2026-10-04 ~13:30 AEST: Ben removed and re-adopted all three cameras in Protect.
+      Reolink adoption stalled at first; diagnosis showed Protect never connected to
+      192.168.2.233 while our discovery + every adoption call answered in ms, so the stall
+      was Protect-side; it completed on retry. After adoption: event subscriptions on all
+      three, Protect reading main+sub streams of all three.
+      Observed Protect usage of the new services (from the `ONVIF Control` log lines):
+      PTZ.ContinuousMove/Stop/GetStatus on Tapo Zoom (joystick works from Protect);
+      DeviceIO.GetRelayOutputs/GetRelayOutputOptions/GetDigitalInputs on the Reolink (polled
+      every ~6 min - Protect consumes relay outputs); Imaging.GetOptions/GetImagingSettings
+      on Tapo Wide. No `Unhandled device operation` lines from Protect.
+- [ ] Ben to try from Protect: joystick on Tapo Zoom, image settings on Reolink/Wide, and the
+      Reolink relays in Alarm Manager (I/O actions, Protect >= 7.2). Then re-read the log.
+- [ ] Known follow-up: `/api/cameras` (web UI list) returns stream URLs with the camera
+      password embedded (pre-existing); mask them.
 
 How to drive things manually / from Protect Alarm Manager webhooks:
 - Token per camera: `curl -s http://192.168.1.51:5552/api/cameras/<id>/device-control`
