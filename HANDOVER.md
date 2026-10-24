@@ -128,6 +128,34 @@ Blocked on Ben (cannot be done autonomously):
   {"tapoCloudPassword": "..."}. ~5 failed logins left before a temporary lockout: do not guess.
 - Re-adoption in Protect (and confirming the Protect version, >= 7.2 for relay actions).
 
+## reportedMac: ONVIF identity override (branch `reported-mac`, NOT deployed) — 2026-10-25
+
+For ai-events-unifi#42 (Back Gate trial). Optional per-camera config key `reportedMac`
+(`AA:BB:CC:DD:EE:FF` or 12 hex; stored lower-case colon form; blank = off). When set it
+replaces the MAC the proxy *reports* over ONVIF; the macvlan vNIC still uses `nicMac` on the
+wire. Reported in: GetNetworkInterfaces `HwAddress` (lower-case colons; this is what Protect
+keys third-party cameras on), GetDeviceInformation `SerialNumber` + `HardwareId` and the
+GetScopes `onvif://www.onvif.org/hardware/...` scope (upper-case, no separators). Code:
+`Camera.identity_mac` (camera.py) is used by every ONVIF identity field; `mac_address`/`nicMac`
+are untouched. Unset = byte-for-byte old behaviour. WS-Discovery `urn:uuid` is `camera.uuid`
+(random/configured), NOT derived from the MAC, so it is unaffected (only the *fallback* MAC is
+derived from the uuid, not the reverse).
+API: `reportedMac` on POST/PUT `/api/cameras[/<id>]`; on PUT an absent key keeps the current
+value, `""` clears it; malformed -> 400; a value already reported by another camera -> 400.
+UI: "Reported ONVIF MAC (Optional)" under the Virtual NIC MAC field. Tests:
+`tests/test_reported_mac.py` (the API tests also need `pyyaml` + `psutil` in the venv; they
+skip without them).
+
+Trial it enables: add Back Gate to the proxy (passthrough, event forwarding on, its own random
+`nicMac`) with `reportedMac` = the physical Back Gate's MAC, then repoint Protect's existing Back
+Gate at the proxy's vNIC IP and see whether Protect keeps the same record/history and gets
+motion. Roll back by repointing at the camera (or clearing `reportedMac`). Risks to watch: the
+physical camera still answers discovery with the same MAC, and ARP for the vNIC IP shows
+`nicMac`, not the reported MAC; if Protect cross-checks either, the trial fails.
+Deploy = scp `app/camera.py app/manager.py app/onvif_service.py app/web.py app/web_template.py`
+to `/mnt/user/appdata/onvif-rtsp/app/` then `docker compose up -d --build` (all cameras drop
+for ~1 min); follow "Verification after deploy" items 1, 2, 4, 5.
+
 ## Deployment facts (so nobody has to rediscover them)
 
 | Item | Value |
