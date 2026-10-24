@@ -11,7 +11,7 @@ from urllib.parse import quote
 from werkzeug.security import generate_password_hash, check_password_hash
 import ipaddress
 from .config import CONFIG_FILE, MEDIAMTX_PORT, MEDIAMTX_API_PORT, AI_DEFAULT_MODEL, WEB_UI_PORT
-from .camera import VirtualONVIFCamera
+from .camera import VirtualONVIFCamera, normalize_mac
 from .onvif_service import ONVIFService
 from .mediamtx_manager import MediaMTXManager
 from .linux_service import LinuxServiceManager
@@ -684,6 +684,16 @@ class CameraManager:
 
         return self.get_grid_fusion()
     
+    def _check_reported_mac(self, reported_mac, exclude_camera_id=None):
+        """Validate/normalise a reportedMac and make sure no other camera already
+        reports that identity (UniFi Protect requires unique MACs)."""
+        mac = normalize_mac(reported_mac)
+        if mac:
+            for c in self.cameras:
+                if c.id != exclude_camera_id and getattr(c, 'identity_mac', '') == mac:
+                    raise ValueError(f"Reported MAC '{reported_mac}' is already the identity of camera '{c.name}'")
+        return mac
+
     def is_port_available(self, port, exclude_camera_id=None):
         """Check if an ONVIF port is available (not used by other cameras)"""
         for camera in self.cameras:
@@ -701,7 +711,8 @@ class CameraManager:
                     static_ip='', netmask='24', gateway='', uuid=None,
                     enable_event_forwarding=False, physical_onvif_port=80,
                     onvif_forwarding_username='', onvif_forwarding_password='',
-                    event_source='onvif', ai_targets=None, ai_model=AI_DEFAULT_MODEL, send_smart_onvif_topics=True):
+                    event_source='onvif', ai_targets=None, ai_model=AI_DEFAULT_MODEL, send_smart_onvif_topics=True,
+                   reported_mac=None):
         """Add a new camera"""
         if not main_path.startswith('/'):
             main_path = '/' + main_path
@@ -719,6 +730,7 @@ class CameraManager:
             for c in self.cameras:
                 if getattr(c, 'nic_mac', None) and str(c.nic_mac).strip().lower().replace(':', '') == mac_str:
                     raise ValueError(f"MAC Address '{nic_mac}' is already in use by camera '{c.name}'")
+        reported_mac = self._check_reported_mac(reported_mac)
         
         rtsp_port = str(rtsp_port)
         
@@ -785,6 +797,7 @@ class CameraManager:
             'vnicKeepalive': vnic_keepalive,
             'parentInterface': parent_interface,
             'nicMac': nic_mac,
+            'reportedMac': reported_mac,
             'ipMode': ip_mode,
             'staticIp': static_ip,
             'netmask': netmask,
@@ -843,11 +856,18 @@ class CameraManager:
                       static_ip='', netmask='24', gateway='', uuid=None,
                       enable_event_forwarding=False, physical_onvif_port=80,
                       onvif_forwarding_username='', onvif_forwarding_password='',
-                      event_source='onvif', ai_targets=None, ai_model=AI_DEFAULT_MODEL, send_smart_onvif_topics=True):
+                      event_source='onvif', ai_targets=None, ai_model=AI_DEFAULT_MODEL, send_smart_onvif_topics=True,
+                   reported_mac=None):
         """Update an existing camera"""
         camera = self.get_camera(camera_id)
         if not camera:
             return None
+        
+        # reportedMac: None = not supplied (keep current), '' = clear.
+        # Validated before the camera is stopped so a bad value changes nothing.
+        if reported_mac is None:
+            reported_mac = camera.reported_mac
+        reported_mac = self._check_reported_mac(reported_mac, exclude_camera_id=camera_id)
         
         # Check if camera is running
         was_running = camera.status == "running"
@@ -932,6 +952,7 @@ class CameraManager:
         camera.vnic_keepalive = vnic_keepalive
         camera.parent_interface = parent_interface
         camera.nic_mac = nic_mac
+        camera.reported_mac = reported_mac
         camera.ip_mode = ip_mode
         camera.static_ip = static_ip
         camera.netmask = netmask

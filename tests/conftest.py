@@ -101,6 +101,10 @@ class FakeVirtualCamera:
         for k, v in kw.items():
             setattr(self, k, v)
 
+    @property
+    def identity_mac(self):
+        return getattr(self, 'reported_mac', '') or self.mac_address
+
     def get_effective_ip(self):
         return "192.0.2.10"
 

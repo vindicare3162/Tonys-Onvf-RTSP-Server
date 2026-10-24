@@ -3929,6 +3929,13 @@ body.theme-dark, body.theme-nord, body.theme-dracula, body.theme-midnight, body.
                                     <button type="button" class="btn btn-secondary" onclick="randomizeMac()" style="padding: 0 15px; font-size: 12px;">Randomize</button>
                                 </div>
                             </div>
+                            <div class="form-group" style="margin-bottom: 15px;">
+                                <label class="form-label">Reported ONVIF MAC (Optional)</label>
+                                <input type="text" class="form-input" id="reportedMac" placeholder="AA:BB:CC:DD:EE:FF" style="font-family: monospace; font-size: 13px;">
+                                <small style="color: var(--text-muted); font-size: 11px; margin-top: 4px; display: block;">
+                                    MAC this camera reports over ONVIF (HwAddress, serial, hardware ID). Set it to the physical camera's MAC to stand in for a camera UniFi Protect already knows. The Virtual NIC still uses the MAC above. Leave blank to report the Virtual NIC MAC.
+                                </small>
+                            </div>
 
                             <div class="form-group">
                                 <label class="form-label">Parent Interface</label>
@@ -6526,6 +6533,7 @@ body.theme-dark, body.theme-nord, body.theme-dracula, body.theme-midnight, body.
             document.getElementById('vnicKeepalive').checked = false;
             document.getElementById('parentInterface').value = '';
             document.getElementById('nicMac').value = '';
+            document.getElementById('reportedMac').value = '';
             document.getElementById('ipMode').value = 'dhcp';
             document.getElementById('staticIp').value = '';
             generateNewUuid();
@@ -6667,6 +6675,7 @@ body.theme-dark, body.theme-nord, body.theme-dracula, body.theme-midnight, body.
             document.getElementById('vnicKeepalive').checked = camera.vnicKeepalive || false;
             document.getElementById('parentInterface').value = camera.parentInterface || '';
             document.getElementById('nicMac').value = camera.nicMac || '';
+            document.getElementById('reportedMac').value = camera.reportedMac || '';
             document.getElementById('ipMode').value = camera.ipMode || 'dhcp';
             document.getElementById('staticIp').value = camera.staticIp || '';
             document.getElementById('netmask').value = camera.netmask || '24';
@@ -8424,6 +8433,7 @@ body.theme-dark, body.theme-nord, body.theme-dracula, body.theme-midnight, body.
                     ? document.getElementById('parentInterfaceManual').value 
                     : document.getElementById('parentInterface').value,
                 nicMac: document.getElementById('nicMac').value,
+                reportedMac: document.getElementById('reportedMac').value.trim(),
                 ipMode: document.getElementById('ipMode').value,
                 staticIp: document.getElementById('staticIp').value,
                 netmask: document.getElementById('netmask').value,

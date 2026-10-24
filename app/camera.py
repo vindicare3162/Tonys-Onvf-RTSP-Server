@@ -4,6 +4,7 @@ import socket
 import time
 import uuid
 import hashlib
+import re
 import queue
 import random
 import requests
@@ -143,6 +144,25 @@ class RTSPFrameGrabber:
             self.cap = None
 
 
+_MAC_COLON_RE = re.compile(r'^[0-9a-f]{2}(:[0-9a-f]{2}){5}$')
+_MAC_BARE_RE = re.compile(r'^[0-9a-f]{12}$')
+
+
+def normalize_mac(value):
+    """Normalise a MAC given as AA:BB:CC:DD:EE:FF or 12 hex digits to
+    lower-case colon form. Empty/None -> ''. Anything else -> ValueError."""
+    if value is None:
+        return ''
+    v = str(value).strip().lower()
+    if not v:
+        return ''
+    if _MAC_BARE_RE.match(v):
+        v = ':'.join(v[i:i + 2] for i in range(0, 12, 2))
+    if not _MAC_COLON_RE.match(v):
+        raise ValueError(f"Invalid MAC address '{value}' (expected AA:BB:CC:DD:EE:FF or 12 hex digits)")
+    return v
+
+
 class VirtualONVIFCamera:
     """Represents a virtual ONVIF camera"""
     
@@ -195,6 +215,14 @@ class VirtualONVIFCamera:
         self.vnic_keepalive = config.get('vnicKeepalive', False)
         self.parent_interface = config.get('parentInterface', '')
         self.nic_mac = config.get('nicMac', '')
+        # Optional MAC reported as this camera's ONVIF identity (HwAddress,
+        # SerialNumber, HardwareId, hardware scope) instead of the vNIC's.
+        # Lets the proxy stand in for a physical camera Protect already knows.
+        try:
+            self.reported_mac = normalize_mac(config.get('reportedMac', ''))
+        except ValueError as e:
+            print(f"  Ignoring reportedMac for camera {config.get('name')}: {e}")
+            self.reported_mac = ''
         self.ip_mode = config.get('ipMode', 'dhcp') # 'dhcp' or 'static'
         self.static_ip = config.get('staticIp', '')
         self.netmask = config.get('netmask', '24')
@@ -299,6 +327,12 @@ class VirtualONVIFCamera:
         # Prefix with 02 to indicate locally administered
         mac = f"02:{h[0:2]}:{h[2:4]}:{h[4:6]}:{h[6:8]}:{h[8:10]}"
         return mac.lower()
+
+    @property
+    def identity_mac(self):
+        """MAC reported to ONVIF clients: reportedMac if set, else mac_address.
+        Never used for the real interface (see start(): the vNIC uses nicMac)."""
+        return self.reported_mac or self.mac_address
         
     def get_effective_ip(self):
         """Determine the IP address that should be reported for this camera"""
@@ -607,12 +641,14 @@ class VirtualONVIFCamera:
             'vnicKeepalive': getattr(self, 'vnic_keepalive', False),
             'parentInterface': self.parent_interface,
             'nicMac': self.nic_mac,
+            'reportedMac': self.reported_mac,
             'ipMode': self.ip_mode,
             'staticIp': self.static_ip,
             'netmask': self.netmask,
             'gateway': self.gateway,
             'assignedIp': self.assigned_ip,
             'macAddress': self.mac_address,
+            'identityMac': self.identity_mac,
             'debugMode': self.debug_mode,
             'enableEventForwarding': self.enable_event_forwarding,
             'physicalOnvifPort': self.physical_onvif_port,
@@ -691,6 +727,7 @@ class VirtualONVIFCamera:
             'vnicKeepalive': getattr(self, 'vnic_keepalive', False),
             'parentInterface': self.parent_interface,
             'nicMac': self.nic_mac,
+            'reportedMac': self.reported_mac,
             'ipMode': self.ip_mode,
             'staticIp': self.static_ip,
             'netmask': self.netmask,

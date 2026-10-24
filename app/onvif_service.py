@@ -526,8 +526,8 @@ class ONVIFService:
             <tds:Manufacturer></tds:Manufacturer>
             <tds:Model>ONVIF {self.camera.name}</tds:Model>
             <tds:FirmwareVersion>1.0.0</tds:FirmwareVersion>
-            <tds:SerialNumber>{self.camera.mac_address.replace(':', '').upper()}</tds:SerialNumber>
-            <tds:HardwareId>{self.camera.mac_address.replace(':', '').upper()}</tds:HardwareId>
+            <tds:SerialNumber>{self.camera.identity_mac.replace(':', '').upper()}</tds:SerialNumber>
+            <tds:HardwareId>{self.camera.identity_mac.replace(':', '').upper()}</tds:HardwareId>
         </tds:GetDeviceInformationResponse>
     </SOAP-ENV:Body>
 </SOAP-ENV:Envelope>"""
@@ -740,7 +740,7 @@ class ONVIFService:
 
     def _handle_get_network_interfaces(self):
         """Handle GetNetworkInterfaces request"""
-        mac = self.camera.mac_address
+        mac = self.camera.identity_mac
         
         soap_response = f"""<?xml version="1.0" encoding="UTF-8"?>
 <SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope"
@@ -1452,7 +1452,7 @@ class ONVIFService:
         scopes = [
             "onvif://www.onvif.org/type/NetworkVideoTransmitter",
             f"onvif://www.onvif.org/name/{self.camera.name.replace(' ', '_')}",
-            f"onvif://www.onvif.org/hardware/{self.camera.mac_address.replace(':', '').upper()}",
+            f"onvif://www.onvif.org/hardware/{self.camera.identity_mac.replace(':', '').upper()}",
             f"onvif://www.onvif.org/location/Home"
         ]
         if self.controls.control.ptz:
